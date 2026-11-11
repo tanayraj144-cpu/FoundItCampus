@@ -10,8 +10,10 @@ require('dotenv').config();
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
+
+// Cloudinary Imports
+const { v2: cloudinary } = require('cloudinary');
+const { CloudinaryStorage } = require('multer-storage-cloudinary');
 
 const app = express();
 
@@ -104,39 +106,24 @@ const notificationSchema = new mongoose.Schema({
 });
 const Notification = mongoose.model('Notification', notificationSchema);
 
-// ==================== IMAGE UPLOAD CONFIGURATION ====================
+// ==================== IMAGE UPLOAD CONFIGURATION (CLOUDINARY) ====================
 
-// Create the uploads folder if it doesn't exist
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir);
-}
+cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET
+});
 
-// Serve the uploads folder as static files so the frontend can display them
-app.use('/uploads', express.static(uploadDir));
-
-const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        cb(null, uploadDir);
-    },
-    filename: function (req, file, cb) {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+const storage = new CloudinaryStorage({
+    cloudinary: cloudinary,
+    params: {
+        folder: 'FoundItCampus',
+        allowed_formats: ['jpg', 'jpeg', 'png', 'webp']
     }
 });
 
-// NFR-5: only images, max 5 MB
-const imageFilter = (req, file, cb) => {
-    const allowed = ['image/jpeg', 'image/png', 'image/webp'];
-    if (allowed.includes(file.mimetype)) return cb(null, true);
-    const err = new Error('Only JPG, PNG or WEBP images are allowed.');
-    err.code = 'INVALID_FILE_TYPE';
-    cb(err);
-};
-
 const upload = multer({
     storage: storage,
-    fileFilter: imageFilter,
     limits: { fileSize: 5 * 1024 * 1024 }
 });
 
@@ -153,11 +140,6 @@ const handleError = (res, error) => {
     }
     console.error(error);
     res.status(500).json({ message: 'Server error.' });
-};
-
-// Delete an uploaded file that we decided not to keep
-const discardUpload = (file) => {
-    if (file && file.path) fs.unlink(file.path, () => { });
 };
 
 // Reject malformed ids before they reach the database
@@ -355,9 +337,11 @@ app.post('/api/auth/login', async (req, res) => {
 
 // POST /api/items (FR-2 & FR-3: Report Lost/Found Item, FR-5/FR-6: matching + notifications)
 app.post('/api/items', authMiddleware, upload.single('image'), async (req, res) => {
-    // Any validation failure below also removes the already-saved upload
-    const fail = (status, message) => {
-        discardUpload(req.file);
+    // If validation fails after multer uploads to Cloudinary, clean up the asset
+    const fail = async (status, message) => {
+        if (req.file && req.file.filename) {
+            await cloudinary.uploader.destroy(req.file.filename).catch(() => { });
+        }
         return res.status(status).json({ message });
     };
 
@@ -365,21 +349,21 @@ app.post('/api/items', authMiddleware, upload.single('image'), async (req, res) 
         const { type, category, color, description, location, date, verificationQuestion } = req.body;
 
         if (!['lost', 'found'].includes(type)) {
-            return fail(400, 'Type must be "lost" or "found".');
+            return await fail(400, 'Type must be "lost" or "found".');
         }
 
-        // FIXED: Image is now only required if the item is 'found'
+        // Image is required only if the item is 'found'
         if (type === 'found' && !req.file) {
-            return fail(400, 'An image is required for found items.');
+            return await fail(400, 'An image is required for found items.');
         }
 
         if (type === 'found' && location === 'Unknown') {
-            return fail(400, 'Found items must have a specific location.');
+            return await fail(400, 'Found items must have a specific location.');
         }
 
         // FR-8: finder must set a verification question
         if (type === 'found' && (!verificationQuestion || !verificationQuestion.trim())) {
-            return fail(400, 'Found items need a verification question.');
+            return await fail(400, 'Found items need a verification question.');
         }
 
         const newItem = new Item({
@@ -389,8 +373,8 @@ app.post('/api/items', authMiddleware, upload.single('image'), async (req, res) 
             description,
             location,
             date,
-            // FIXED: Safely handle missing images for lost items
-            imageUrl: req.file ? `/uploads/${req.file.filename}` : undefined,
+            // Cloudinary provides the full secure URL on req.file.path
+            imageUrl: req.file ? req.file.path : undefined,
             verificationQuestion: type === 'found' ? verificationQuestion : undefined,
             reportedBy: req.user.userId
         });
@@ -410,7 +394,9 @@ app.post('/api/items', authMiddleware, upload.single('image'), async (req, res) 
             matchCount: matches.length
         });
     } catch (error) {
-        discardUpload(req.file);
+        if (req.file && req.file.filename) {
+            await cloudinary.uploader.destroy(req.file.filename).catch(() => { });
+        }
         handleError(res, error);
     }
 });
@@ -767,10 +753,12 @@ app.delete('/api/admin/items/:id', authMiddleware, adminOnly, validateId, async 
             return res.status(404).json({ message: 'Item not found.' });
         }
 
-        // Remove the image file and everything that points to this item
+        // Delete the image file from Cloudinary instead of local storage
         if (item.imageUrl) {
-            fs.unlink(path.join(uploadDir, path.basename(item.imageUrl)), () => { });
+            const filename = item.imageUrl.split('/').pop().split('.')[0];
+            await cloudinary.uploader.destroy(`FoundItCampus/${filename}`).catch(() => { });
         }
+
         await Claim.deleteMany({ item: item._id });
         await Notification.deleteMany({ relatedItem: item._id });
         await item.deleteOne();
